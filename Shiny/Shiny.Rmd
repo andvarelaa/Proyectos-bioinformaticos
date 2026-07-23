@@ -1,0 +1,304 @@
+---
+title: "Shiny"
+output: html_document
+---
+
+```{r}
+# ------------------------------------------------------------------------------
+# LIBRERÍAS NECESARIAS
+# ------------------------------------------------------------------------------
+library(shiny)
+library(shinydashboard)
+library(caret)
+library(e1071)
+library(kernlab)
+library(C50)
+library(randomForest)
+
+# ------------------------------------------------------------------------------
+# INTERFAZ DE USUARIO (UI)
+# ------------------------------------------------------------------------------
+ui <- dashboardPage(
+  skin = "blue",
+  dashboardHeader(title = "Panel de Clasificación"),
+  
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Carga de Datos", tabName = "data", icon = icon("database")),
+      menuItem("Entrenamiento y Modelos", tabName = "models", icon = icon("cogs")),
+      menuItem("Comparativa de Resultados", tabName = "comparison", icon = icon("chart-bar"))
+    )
+  ),
+  
+  dashboardBody(
+    tabItems(
+      # --- PESTAÑA 1: Carga de datos ---
+      tabItem(
+        tabName = "data",
+        fluidRow(
+          box(
+            title = "Cargar Archivo de Datos", width = 12, status = "primary", solidHeader = TRUE,
+            fileInput("file1", "Seleccionar archivo TXT o CSV",
+                      multiple = FALSE,
+                      accept = c("text/csv", "text/comma-separated-values,text/plain", ".csv", ".txt")),
+            checkboxInput("header", "El archivo tiene encabezado (Header)", TRUE),
+            radioButtons("sep", "Separador de columnas:",
+                         choices = c(Coma = ",", Punto_y_Coma = ";", Tabulación = "\t", Espacio = " "),
+                         selected = ","), # CAMBIO: Por defecto Coma para archivos CSV
+            hr(),
+            sliderInput("p_train", "Porcentaje de entrenamiento (Train %):",
+                        min = 50, max = 90, value = 67, step = 1)
+          )
+        ),
+        fluidRow(
+          box(
+            title = "Vista previa del dataset", width = 12, status = "info",
+            verbatimTextOutput("data_summary"),
+            tableOutput("contents")
+          )
+        )
+      ),
+      
+      # --- PESTAÑA 2: Entrenamiento y Parámetros ---
+      tabItem(
+        tabName = "models",
+        fluidRow(
+          box(
+            title = "Parámetros de los Modelos", width = 4, status = "warning", solidHeader = TRUE,
+            sliderInput("k_val", "kNN (Número de vecinos k):", min = 1, max = 21, value = 3, step = 2),
+            numericInput("laplace_val", "Naive Bayes (Laplace smoothing):", value = 0, min = 0, max = 5),
+            selectInput("kernel_val", "SVM (Tipo de Kernel):", 
+                        choices = c("Lineal (vanilladot)" = "vanilladot", "Gaussiano/RBF (rbfdot)" = "rbfdot")),
+            numericInput("trials_val", "C5.0 (Boosting trials):", value = 1, min = 1, max = 50),
+            numericInput("ntree_val", "Random Forest (Número de árboles):", value = 100, min = 10, max = 1000, step = 50)
+          ),
+          
+          box(
+            title = "Resultados e Inspección de Modelos", width = 8, status = "primary", solidHeader = TRUE,
+            tabsetPanel(
+              tabPanel("kNN", verbatimTextOutput("knn_out")),
+              tabPanel("Naive Bayes", verbatimTextOutput("nb_out")),
+              tabPanel("SVM", verbatimTextOutput("svm_out")),
+              tabPanel("C5.0", verbatimTextOutput("c50_out")),
+              tabPanel("Random Forest", 
+                       verbatimTextOutput("rf_out"),
+                       plotOutput("rf_plot"))
+            )
+          )
+        )
+      ),
+      
+      # --- PESTAÑA 3: Comparativa ---
+      tabItem(
+        tabName = "comparison",
+        fluidRow(
+          box(
+            title = "Tabla Resumen de Rendimiento", width = 12, status = "success", solidHeader = TRUE,
+            tableOutput("summary_table"),
+            plotOutput("comparison_plot")
+          )
+        )
+      )
+    )
+  )
+)
+
+# ------------------------------------------------------------------------------
+# LÓGICA DEL SERVIDOR (SERVER)
+# ------------------------------------------------------------------------------
+server <- function(input, output, session) {
+  
+  # 1. Carga de datos reactiva con lectura robusta
+  data_raw <- reactive({
+    req(input$file1)
+    
+    # Intento 1: Leer con el separador seleccionado por el usuario
+    df <- read.table(input$file1$datapath, 
+                     header = input$header, 
+                     sep = input$sep, 
+                     stringsAsFactors = FALSE,
+                     strip.white = TRUE)
+    
+    # AUTODETECCIÓN: Si falla y devuelve solo 1 columna, probar otros separadores estándar
+    if (ncol(df) == 1) {
+      posibles_seps <- c(",", ";", "\t", " ")
+      for (s in posibles_seps) {
+        temp_df <- read.table(input$file1$datapath, 
+                              header = input$header, 
+                              sep = s, 
+                              stringsAsFactors = FALSE,
+                              strip.white = TRUE)
+        if (ncol(temp_df) > 1) {
+          df <- temp_df
+          break
+        }
+      }
+    }
+    
+    return(df)
+  })
+
+  # Vista previa de datos
+  output$contents <- renderTable({
+    head(data_raw(), 5)
+  })
+  
+  output$data_summary <- renderPrint({
+    summary(data_raw())
+  })
+  
+  # 2. Procesamiento y evaluación con validación de seguridad
+  models_results <- reactive({
+    df <- data_raw()
+    req(df)
+    
+    # Validar que el archivo se haya separado en más de 1 columna
+    validate(
+      need(ncol(df) > 1, "Error al leer el archivo: Comprueba el 'Separador' seleccionado en la Pestaña 1. Actualmente solo se detectó 1 columna.")
+    )
+    
+    pClass <- ncol(df)
+    
+    # Extraer la clase objetivo (última columna)
+    y_raw <- factor(df[, pClass])
+    if (nlevels(y_raw) == 2) {
+      levels(y_raw) <- c("No", "Si")
+    }
+    
+    # Convertir predictores a numéricos
+    X_raw <- df[, 1:(pClass - 1), drop = FALSE]
+    X_num <- as.data.frame(lapply(X_raw, function(col) {
+      as.numeric(as.character(col))
+    }))
+    
+    df_clean <- X_num
+    df_clean$class <- y_raw
+    
+    # Eliminar filas con NAs
+    df_clean <- df_clean[complete.cases(df_clean), ]
+    
+    # Validar que queden suficientes filas
+    validate(
+      need(nrow(df_clean) >= 10, paste("Se encontraron solo", nrow(df_clean), "filas válidas. Revisa si la conversión introdujo NAs o si el separador es correcto."))
+    )
+    
+    # Normalización Min-Max
+    normalize <- function(x) {
+      rng <- range(x, na.rm = TRUE)
+      if (rng[1] == rng[2]) return(rep(0, length(x)))
+      return((x - rng[1]) / (rng[2] - rng[1]))
+    }
+    
+    var_num <- 1:(ncol(df_clean) - 1)
+    df_norm <- df_clean
+    df_norm[, var_num] <- as.data.frame(lapply(df_clean[, var_num, drop = FALSE], normalize))
+    
+    # Partición Train / Test
+    set.seed(123)
+    train_idx <- createDataPartition(df_clean$class, p = input$p_train / 100, list = FALSE)
+    
+    train_orig <- df_clean[train_idx, ]
+    test_orig  <- df_clean[-train_idx, ]
+    
+    train_norm <- df_norm[train_idx, ]
+    test_norm  <- df_norm[-train_idx, ]
+    
+    y_test <- test_orig$class
+    
+    # --- MODELOS ---
+    # A) kNN
+    set.seed(123)
+    pred_knn <- class::knn(train = train_norm[, var_num, drop = FALSE], 
+                           test  = test_norm[, var_num, drop = FALSE], 
+                           cl    = train_norm$class, 
+                           k     = input$k_val)
+    cm_knn <- confusionMatrix(pred_knn, y_test)
+    
+    # B) Naive Bayes
+    set.seed(123)
+    nb_mod <- naiveBayes(class ~ ., data = train_orig, laplace = input$laplace_val)
+    pred_nb <- predict(nb_mod, test_orig)
+    cm_nb <- confusionMatrix(pred_nb, y_test)
+    
+    # C) SVM
+    set.seed(123)
+    svm_mod <- ksvm(class ~ ., data = train_norm, kernel = input$kernel_val)
+    pred_svm <- predict(svm_mod, test_norm)
+    cm_svm <- confusionMatrix(pred_svm, y_test)
+    
+    # D) C5.0
+    set.seed(123)
+    c50_mod <- C5.0(class ~ ., data = train_orig, trials = input$trials_val)
+    pred_c50 <- predict(c50_mod, test_orig)
+    cm_c50 <- confusionMatrix(pred_c50, y_test)
+    
+    # E) Random Forest
+    set.seed(123)
+    rf_mod <- randomForest(class ~ ., data = train_orig, ntree = input$ntree_val)
+    pred_rf <- predict(rf_mod, test_orig)
+    cm_rf <- confusionMatrix(pred_rf, y_test)
+    
+    list(
+      cm_knn = cm_knn,
+      cm_nb  = cm_nb,
+      cm_svm = cm_svm,
+      cm_c50 = cm_c50,
+      cm_rf  = cm_rf,
+      rf_mod = rf_mod
+    )
+  })
+
+  # 3. Salidas de texto e inspección
+  output$knn_out <- renderPrint({ models_results()$cm_knn })
+  output$nb_out  <- renderPrint({ models_results()$cm_nb })
+  output$svm_out <- renderPrint({ models_results()$cm_svm })
+  output$c50_out <- renderPrint({ models_results()$cm_c50 })
+  output$rf_out  <- renderPrint({ models_results()$cm_rf })
+  
+  output$rf_plot <- renderPlot({
+    req(models_results())
+    varImpPlot(models_results()$rf_mod, main = "Importancia de Variables (Random Forest)")
+  })
+
+  # 4. Tabla y gráfico comparativo
+  summary_df <- reactive({
+    res <- models_results()
+    data.frame(
+      Algoritmo = c("kNN", "Naive Bayes", "SVM", "C5.0", "Random Forest"),
+      Accuracy  = c(res$cm_knn$overall["Accuracy"],
+                    res$cm_nb$overall["Accuracy"],
+                    res$cm_svm$overall["Accuracy"],
+                    res$cm_c50$overall["Accuracy"],
+                    res$cm_rf$overall["Accuracy"]),
+      Kappa     = c(res$cm_knn$overall["Kappa"],
+                    res$cm_nb$overall["Kappa"],
+                    res$cm_svm$overall["Kappa"],
+                    res$cm_c50$overall["Kappa"],
+                    res$cm_rf$overall["Kappa"])
+    )
+  })
+
+  output$summary_table <- renderTable({
+    summary_df()
+  }, digits = 4)
+
+  output$comparison_plot <- renderPlot({
+    df <- summary_df()
+    barplot(rbind(df$Accuracy, df$Kappa), 
+            beside = TRUE, 
+            names.arg = df$Algoritmo,
+            col = c("steelblue", "orange"),
+            legend.text = c("Accuracy", "Kappa"),
+            args.legend = list(x = "topleft"),
+            main = "Comparativa de Precisión (Accuracy) y Kappa entre Modelos",
+            ylim = c(0, 1))
+  })
+}
+
+# ------------------------------------------------------------------------------
+# EJECUCIÓN
+# ------------------------------------------------------------------------------
+shinyApp(ui = ui, server = server)
+```
+
+
